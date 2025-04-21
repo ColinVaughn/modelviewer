@@ -1,8 +1,8 @@
-// script.js
 import * as THREE from 'three';
 import { OrbitControls } from 'three/controls/OrbitControls.js';
 import { TransformControls } from 'three/controls/TransformControls.js';
 import { OBJLoader } from 'three/loaders/OBJLoader.js';
+import { MeshBVH, acceleratedRaycast } from 'https://unpkg.com/three-mesh-bvh@0.6.4/build/index.module.js';
 
 let scene, camera, renderer;
 let orbitControls;
@@ -11,6 +11,10 @@ let model = null;
 const hitboxes = [];
 let selectedHitbox = null;
 let previousSelected = null;
+
+THREE.Mesh.prototype.raycast = acceleratedRaycast;
+
+
 
 init();
 animate();
@@ -85,6 +89,13 @@ document.getElementById('autoBtn')
  * Returns true if `point` lies inside `model`, by raycasting along
  * the six cardinal directions and checking for an odd hit‑count.
  */
+function setupBVH(mesh) {
+    mesh.traverse(child => {
+        if (child.isMesh) {
+            child.geometry.boundsTree = new MeshBVH(child.geometry);
+        }
+    });
+}
 function isInside(point, raycaster, model) {
     const dirs = [
         new THREE.Vector3( 1,  0,  0),
@@ -106,68 +117,84 @@ function isInside(point, raycaster, model) {
 }
 
 
+/**
+ * Auto-generate hitboxes by voxelizing the model bounding box.
+ * @param {number} quality — number of voxels per axis (e.g. 5 = 5×5×5 grid)
+ */
 function autoGenerateHitboxes(quality) {
     if (!model) {
         alert('Please load a model first.');
         return;
     }
 
-    // 1) clear existing hitboxes
     hitboxes.forEach(hb => scene.remove(hb));
     hitboxes.length = 0;
     selectedHitbox = previousSelected = null;
     updateHitboxList();
 
-    // 2) bounding‐box & step
     const bbox = new THREE.Box3().setFromObject(model);
-    const min = bbox.min, max = bbox.max;
+    const min = bbox.min.clone();
+    const max = bbox.max.clone();
     const size = new THREE.Vector3().subVectors(max, min);
     const step = size.clone().divideScalar(quality);
 
-    // 3) raycaster
-    const raycaster = new THREE.Raycaster();
+    const threshold = Math.min(step.x, step.y, step.z) * 0.6;
+    const tempSphere = new THREE.Sphere();
+    const pos = new THREE.Vector3();
 
-    // 4) grid sampling
+    const meshes = [];
+    model.traverse(child => {
+        if (child.isMesh && child.geometry.boundsTree) {
+            meshes.push(child);
+        }
+    });
+
     for (let i = 0; i < quality; i++) {
         for (let j = 0; j < quality; j++) {
             for (let k = 0; k < quality; k++) {
-                // sample at cell center
-                const sample = new THREE.Vector3(
+                pos.set(
                     min.x + (i + 0.5) * step.x,
                     min.y + (j + 0.5) * step.y,
                     min.z + (k + 0.5) * step.z
                 );
 
-                // test inclusion
-                if (!isInside(sample, raycaster, model)) continue;
+                let isNearSurface = false;
+                for (const mesh of meshes) {
+                    tempSphere.center.copy(pos);
+                    tempSphere.radius = threshold;
+                    const hits = mesh.geometry.boundsTree.intersectsSphere(tempSphere);
+                    if (hits) {
+                        isNearSurface = true;
+                        break;
+                    }
+                }
 
-                // create a wireframe box at that position
-                const geo = new THREE.BoxGeometry(step.x, step.y, step.z);
-                const mat = new THREE.MeshBasicMaterial({
-                    color: 0xff0000,
-                    wireframe: true
-                });
-                const box = new THREE.Mesh(geo, mat);
-                box.position.copy(sample);
-                box.userData.name = `auto_${hitboxes.length}`;
+                if (isNearSurface) {
+                    const geo = new THREE.BoxGeometry(step.x, step.y, step.z);
+                    const mat = new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true });
+                    const box = new THREE.Mesh(geo, mat);
+                    box.position.copy(pos);
+                    box.userData.name = `auto_${hitboxes.length}`;
 
-                // attach label
-                const label = makeLabel(box.userData.name);
-                label.position.set(0, step.y/2 + 0.1, 0);
-                box.add(label);
-                box.userData.label = label;
+                    const label = makeLabel(box.userData.name);
+                    label.position.set(0, step.y / 2 + 0.1, 0);
+                    box.add(label);
+                    box.userData.label = label;
 
-                scene.add(box);
-                hitboxes.push(box);
+                    scene.add(box);
+                    hitboxes.push(box);
+                }
             }
         }
     }
 
-    // 5) select first if any
-    if (hitboxes.length) {
+    if (hitboxes.length > 0) {
         selectHitbox(hitboxes[0]);
     }
 }
+
+
+
 
 
 // Helper to build a TransformControls with optional snapping:
@@ -218,9 +245,13 @@ function handleModelLoad(e) {
         if (model) scene.remove(model);
         model = loader.parse(ev.target.result);
         scene.add(model);
+
+        // Build BVH after model is loaded
+        setupBVH(model);
     };
     reader.readAsText(file);
 }
+
 
 function addHitbox() {
     const geo = new THREE.BoxGeometry(1, 1, 1);
